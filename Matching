@@ -1,0 +1,423 @@
+"""
+Matching agent for bank-to-remittance reconciliation.
+
+Uses LLM-powered matching with tool-calling approach to reconcile bank transaction
+records with remittance records from Cosmos DB.
+"""
+
+import json
+import logging
+from typing import List, Optional
+
+from langchain.agents import create_agent
+from langchain.tools import tool
+from langchain_openai import AzureChatOpenAI
+from pydantic import SecretStr
+
+from .models import (
+    BankRecord,
+    RemittanceRecord,
+    MatchResult,
+    MatchDetails,
+    LLMMatchingOutput,
+)
+from .repository import MatchingRepository
+
+logger = logging.getLogger(__name__)
+
+AMOUNT_TOLERANCE = 0.05
+
+BANK_CONTAINER = "bank-statement-container"
+REMITTANCE_CONTAINER = "remittances-container"
+MATCH_CONTAINER = "match-data-container"
+
+
+SYSTEM_PROMPT = """You are a professional financial accountant specializing in payment reconciliation.
+
+Your task is to match bank transaction records with remittance records to verify payments.
+
+MATCHING RULES:
+1. Use the search_remittances tool to find potential matching remittances.
+2. Match based on:
+   - paymentAmount: Must match exactly (or within small tolerance)
+   - customerName: Can be fuzzy match (e.g., "GOOGLE CLOUD CG Business Sol" matches "GOOGLE CLOUD")
+   - payment/paymentType: Optional matching criteria
+
+DECISION CRITERIA:
+- If a remittance is found with matching amount AND similar customer name -> MATCH
+- If no remittance found then don't match -> NO MATCH
+
+OUTPUT REQUIREMENTS:
+Return a structured response with:
+- is_match: true or false
+- matched_remittance_id: the remittance_unique_id if matched, else null
+- matching_reason: explanation
+"""
+
+
+class MatchingAgent:
+    """Agent to match bank records with remittance records using LangChain v1 create_agent."""
+
+    def __init__(
+        self,
+        repository: MatchingRepository = None,
+        bank_container_name: str = BANK_CONTAINER,
+        remittance_container_name: str = REMITTANCE_CONTAINER,
+        match_container_name: str = MATCH_CONTAINER,
+        llm_client=None,
+    ):
+        self.repository = repository or MatchingRepository()
+        self.bank_container_name = bank_container_name
+        self.remittance_container_name = remittance_container_name
+        self.match_container_name = match_container_name
+
+        # Cache remittances for tool access
+        self._remittances_cache: List[dict] = []
+
+        # Initialize LLM
+        self.llm = llm_client or self._create_llm()
+
+        # Create tool(s)
+        self.search_tool = self._create_search_remittances_tool()
+
+        # Create the agent (LangChain v1)
+        self.agent = self._create_agent()
+
+    def _create_llm(self):
+        """Create Azure OpenAI LLM client using current AzureChatOpenAI params."""
+        import os
+        from dotenv import load_dotenv
+
+        load_dotenv()
+
+        # LangChain docs: AzureChatOpenAI uses AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT,
+        # and is instantiated with azure_deployment + api_version. [2](https://docs.langchain.com/oss/python/integrations/chat/azure_chat_openai)
+        return AzureChatOpenAI(
+        azure_deployment=os.getenv("AZURE_DEPLOYMENT"),
+        api_version=os.getenv("API_VERSION"),
+        azure_endpoint=os.getenv("AZURE_ENDPOINT"),
+        api_key=SecretStr(os.getenv("API_KEY")),
+    )
+
+
+    def _create_search_remittances_tool(self):
+        """Create the search_remittances tool for querying remittances."""
+        agent_self = self
+
+        @tool
+        def search_remittances(payment_amount: float, customer_name: str) -> str:
+            """
+            Search for remittance records matching the given payment amount and customer name.
+
+            Args:
+                payment_amount: Payment amount to search for (match with tolerance)
+                customer_name: Customer name to search for (fuzzy match)
+
+            Returns:
+                JSON string list of matching remittance records, or empty list.
+            """
+            try:
+                items = agent_self._remittances_cache
+
+                # Filter by payment amount (within tolerance)
+                amount_matched = []
+                for item in items:
+                    remittance_details = item.get("remittanceDetails", {})
+                    remittance_amount = remittance_details.get("paymentAmount", 0)
+
+                    if isinstance(remittance_amount, str):
+                        try:
+                            remittance_amount = float(remittance_amount)
+                        except ValueError:
+                            continue
+
+                    if abs(remittance_amount - payment_amount) <= AMOUNT_TOLERANCE:
+                        amount_matched.append(item)
+
+                # Filter by customer name (fuzzy matching)
+                customer_name_lower = (customer_name or "").lower()
+                filtered_items = []
+
+                for item in amount_matched:
+                    remittance_customer = (
+                        item.get("remittanceDetails", {}).get("customerName", "") or ""
+                    ).lower()
+
+                    if (
+                        remittance_customer in customer_name_lower
+                        or customer_name_lower in remittance_customer
+                        or any(word in customer_name_lower for word in remittance_customer.split())
+                        or any(word in remittance_customer for word in customer_name_lower.split())
+                    ):
+                        filtered_items.append(item)
+
+                if filtered_items:
+                    logger.info(
+                        f"Found {len(filtered_items)} matching remittances "
+                        f"for amount={payment_amount}, customer={customer_name}"
+                    )
+                    return json.dumps(filtered_items, indent=2, default=str)
+
+                logger.info(
+                    f"No remittances found for amount={payment_amount}, customer={customer_name}"
+                )
+                return json.dumps([], indent=2)
+
+            except Exception as e:
+                logger.error(f"Error searching remittances: {e}")
+                return json.dumps({"error": str(e)})
+
+        return search_remittances
+
+    def _create_agent(self):
+        """
+        Create the agent using LangChain v1 `create_agent`.
+        """
+        tools = [self.search_tool]
+
+        agent = create_agent(
+            model=self.llm,
+            tools=tools,
+            system_prompt=SYSTEM_PROMPT,
+            response_format=LLMMatchingOutput,  
+        )
+        return agent
+
+    def _get_bank_records(self) -> List[BankRecord]:
+        items = self.repository.get_cosmos_items(self.bank_container_name)
+
+        records = []
+        for item in items:
+            try:
+                clean_item = {k: v for k, v in item.items() if not k.startswith("_")}
+                if isinstance(clean_item.get("paymentAmount"), str):
+                    clean_item["paymentAmount"] = float(clean_item["paymentAmount"])
+
+                status = clean_item.get("status", "unprocessed")
+                if status == "unprocessed":
+                    records.append(BankRecord(**clean_item))
+            except Exception as e:
+                logger.warning(f"Skipping invalid bank record: {e}")
+
+        logger.info(f"Loaded {len(records)} unprocessed bank records")
+        return records
+
+    def _load_remittances(self) -> List[dict]:
+        items = self.repository.get_cosmos_items(self.remittance_container_name)
+        logger.info(f"Loaded {len(items)} remittances into cache")
+        return items
+
+    def _get_remittance_by_id(self, remittance_id: str) -> Optional[RemittanceRecord]:
+        for item in self._remittances_cache:
+            if item.get("remittance_unique_id") == remittance_id:
+                try:
+                    clean_item = {k: v for k, v in item.items() if not k.startswith("_")}
+                    return RemittanceRecord(**clean_item)
+                except Exception as e:
+                    logger.warning(f"Error parsing remittance {remittance_id}: {e}")
+                    return None
+        return None
+
+    def _save_match_result(self, result: MatchResult):
+        result_dict = result.model_dump()
+        result_dict["id"] = result.payment_unique_id
+        
+        # In match-data-container, the partition key is transaction_id
+        # We'll use payment_unique_id for transaction_id as well
+        result_dict["transaction_id"] = result.payment_unique_id
+
+        success = self.repository.upsert_cosmos_item(
+            self.match_container_name, 
+            result_dict, 
+            partition_key=result_dict["transaction_id"]
+        )
+        if success:
+            logger.info(f"Saved match result: {result.payment_unique_id}")
+        else:
+            logger.error(f"Failed to save match result: {result.payment_unique_id}")
+
+        return result_dict
+
+    def _update_bank_record_status(self, bank_record: BankRecord, status: str = "processed"):
+        """Update the status of a bank record in Cosmos DB."""
+        bank_record.status = status
+        record_dict = bank_record.model_dump()
+        
+        # Ensure 'id' is present for upsert
+        if not record_dict.get("id"):
+            record_dict["id"] = bank_record.payment_unique_id
+            
+        # bank-statement-container partition key is payment_unique_id
+        partition_key = bank_record.payment_unique_id
+        success = self.repository.upsert_cosmos_item(
+            self.bank_container_name, 
+            record_dict, 
+            partition_key=partition_key
+        )
+        if success:
+            logger.info(f"Updated bank record {bank_record.payment_unique_id} status to {status}")
+        else:
+            logger.error(f"Failed to update bank record {bank_record.payment_unique_id} status")
+
+    def _match_single_bank_record(self, bank_record: BankRecord) -> MatchResult:
+        logger.info(f"Processing bank record: {bank_record.payment_unique_id}")
+
+        # Build a single user message (LangChain v1 agents are invoked via messages). [1](https://docs.langchain.com/oss/python/langchain/agents)
+        user_msg = f"""Match this bank record with remittances:
+
+Bank Record:
+- payment_unique_id: {bank_record.payment_unique_id}
+- paymentAmount: {bank_record.paymentAmount}
+- customerName: {bank_record.customerName}
+- paymentDate: {bank_record.paymentDate}
+- paymentType: {bank_record.paymentType or ""}
+- bank_file_location: {bank_record.bank_file_location or ""}
+
+Use the search_remittances tool to find matching remittances, then provide your matching decision.
+"""
+
+        try:
+            result = self.agent.invoke(
+                {"messages": [{"role": "user", "content": user_msg}]}
+            )
+
+            # With response_format, LangChain returns the parsed object at structured_response. [1](https://docs.langchain.com/oss/python/langchain/agents)
+            structured = result.get("structured_response")
+
+            if isinstance(structured, dict):
+                decision = LLMMatchingOutput(**structured)
+            else:
+                decision = structured  # already a Pydantic object
+
+            is_match = bool(decision.is_match)
+            matched_id = decision.matched_remittance_id
+            reason = decision.matching_reason
+
+        except Exception as e:
+            logger.error(f"Agent error for {bank_record.payment_unique_id}: {e}")
+            is_match = False
+            matched_id = None
+            reason = f"Error during matching: {str(e)}"
+
+        if is_match and matched_id:
+            remittance = self._get_remittance_by_id(matched_id)
+
+            if remittance:
+                invoices = remittance.remittanceDetails.invoices
+                invoice_count = len(invoices)
+
+                if invoice_count > 1:
+                    invoice_numbers = ["Multiple"]
+                elif invoice_count == 1:
+                    invoice_numbers = ["single"]
+                else:
+                    invoice_numbers = []
+
+                return MatchResult(
+                    remittance_file_location=remittance.remittance_file_location,
+                    bank_file_location=bank_record.bank_file_location,
+                    payment_unique_id=bank_record.payment_unique_id,
+                    invoiceNumbers=invoice_numbers,
+                    paymentAmount=remittance.remittanceDetails.paymentAmount,
+                    customerName=remittance.remittanceDetails.customerName,
+                    paymentDate=remittance.remittanceDetails.paymentDate or bank_record.paymentDate,
+                    remittance_details=MatchDetails(
+                        invoices=invoices,
+                        Matching_Status="Match",
+                        Matching_Reason=reason or "Remittance has been matched",
+                    ),
+                )
+
+            return self._create_no_match_result(bank_record, "Matched remittance not found in database")
+
+        return self._create_no_match_result(bank_record, reason or "Remittance not found")
+
+    def _create_no_match_result(self, bank_record: BankRecord, reason: str) -> MatchResult:
+        return MatchResult(
+            remittance_file_location=None,
+            bank_file_location=bank_record.bank_file_location,
+            payment_unique_id=bank_record.payment_unique_id,
+            invoiceNumbers=[],
+            paymentAmount=bank_record.paymentAmount,
+            customerName=bank_record.customerName,
+            paymentDate=bank_record.paymentDate,
+            remittance_details=MatchDetails(
+                invoices=[],
+                Matching_Status="NoMatch",
+                Matching_Reason=reason,
+            ),
+        )
+
+    def run(self) -> List[MatchResult]:
+        logger.info("Starting matching agent...")
+
+        self._remittances_cache = self._load_remittances()
+        bank_records = self._get_bank_records()
+
+        if not bank_records:
+            logger.info("No bank records to process")
+            return []
+
+        results: List[MatchResult] = []
+
+        for bank_record in bank_records:
+            try:
+                # 1. First, check if bank record already has invoices (Skip search)
+                if bank_record.invoiceNumbers and len(bank_record.invoiceNumbers) > 0:
+                    logger.info(
+                        f"Bank record {bank_record.payment_unique_id} has invoices "
+                        f"{bank_record.invoiceNumbers}. Skipping remittance search."
+                    )
+                    # Create skeletal invoice objects for validation agent
+                    skeletal_invoices = [
+                        {"invoiceNumber": inv, "amount": 0.0}
+                        for inv in bank_record.invoiceNumbers
+                    ]
+                    result = MatchResult(
+                        remittance_file_location=None,
+                        bank_file_location=bank_record.bank_file_location,
+                        payment_unique_id=bank_record.payment_unique_id,
+                        invoiceNumbers=bank_record.invoiceNumbers,
+                        paymentAmount=bank_record.paymentAmount,
+                        customerName=bank_record.customerName,
+                        paymentDate=bank_record.paymentDate,
+                        remittance_details=MatchDetails(
+                            invoices=skeletal_invoices,
+                            Matching_Status="Match",
+                            Matching_Reason="Invoice numbers already available in bank record",
+                        ),
+                    )
+                else:
+                    # 2. Match via LLM/Remittance search
+                    result = self._match_single_bank_record(bank_record)
+
+                self._save_match_result(result)
+                results.append(result)
+                
+                # Update bank statement status to processed
+                self._update_bank_record_status(bank_record, "processed")
+
+                logger.info(
+                    f"Matched {bank_record.payment_unique_id}: "
+                    f"Status={result.remittance_details.Matching_Status}"
+                )
+            except Exception as e:
+                logger.error(f"Error processing {bank_record.payment_unique_id}: {e}")
+
+        logger.info(f"Matching complete. Processed {len(results)} records.")
+        return results
+
+
+def create_matching_agent() -> MatchingAgent:
+    repository = MatchingRepository()
+    return MatchingAgent(repository=repository)
+
+
+# if __name__ == "__main__":
+#     logging.basicConfig(level=logging.INFO)
+
+#     agent = create_matching_agent()
+#     results = agent.run()
+
+#     for result in results:
+#         print(json.dumps(result.model_dump(), indent=2, default=str))
