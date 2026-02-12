@@ -1,0 +1,638 @@
+"""Validation agent for match-data vs ERP reconciliation.
+
+Reads from match-data-container, validates against erp-data-container,
+writes validated results to match-validation-container, and updates ERP status.
+
+Uses a hybrid approach — deterministic Python code handles all validation
+logic (threshold comparison, status/reason assignment), while the LLM
+orchestrates the workflow by calling tools in the correct order.
+"""
+
+import json
+import logging
+import os
+import time
+from typing import Dict, List, Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.tools import tool
+from langchain_openai import AzureChatOpenAI
+
+from ..core.config import get_settings
+from .models import (
+    ValidatedInvoice,
+    ERPRecord,
+    LLMValidationDecision,
+    ValidationMatchDetails,
+    ValidationResult,
+)
+from .repository import ValidationRepository
+
+logger = logging.getLogger(__name__)
+
+# ── Container name constants ─────────────────────────────────────────────────
+
+MATCH_DATA_CONTAINER = "match-data-container"
+ERP_DATA_CONTAINER = "erp-data-container"
+VALIDATION_CONTAINER = "match-validation-data"
+
+# ── System prompt ────────────────────────────────────────────────────────────
+
+VALIDATION_SYSTEM_PROMPT = """You are a financial reconciliation validation agent.
+
+Your job is to validate match-data records against ERP (Enterprise Resource Planning) data and produce validated output.
+
+## WORKFLOW
+
+1. Call `fetch_match_data` to get ALL match records.
+2. For EACH match record, process according to its matching_status:
+   a. If matching_status is "NoMatch" or "No Match" -> call `save_validation_result` directly with matching_status="No Match", erp_status="Open", empty invoices, and empty reasoning.
+   b. If matching_status is "Match" -> identify the invoice numbers to validate:
+      - Priority 1: If `remittance_details.invoices` contains objects, use those `invoiceNumber`s.
+      - Priority 2: If `remittance_details.invoices` is empty, use the root-level `invoiceNumbers` list.
+      - For EACH identified invoice:
+        - Call `search_erp` with the `invoiceNumber` to find the record.
+        - Call `validate_invoice` with the invoice amount, ERP amount, customer name, and ERP customer name to get the deterministic validation result.
+   c. After validating all invoices, call `save_validation_result` with the results.
+   d. If the overall result is "Match", call `update_erp_status` with the list of matched invoice numbers.
+3. After processing ALL records, provide a brief summary.
+
+## ERP MATCHING PRIORITY
+
+When `search_erp` returns multiple records for the same invoice number, pick the one where:
+1. `invoiceNumber` matches the record's `invoiceNumber`
+2. `amount` is closest to the invoice amount
+
+## HANDLING EDGE CASES
+
+### No invoices in a Match record
+- If matching_status is "Match" but the invoices list is empty, the record needs validation at the payment level.
+- Call `search_erp` with any available identifier (use customer name to find ERP records).
+- Compare `paymentAmount` from the match record with the ERP `amount`.
+
+### Discount/Adjustment invoices
+- If an invoice has a negative amount and shares the same `invoiceNumber` as another invoice, it is a discount.
+- Subtract the discount from the positive invoice's amount before calling `validate_invoice`.
+- For the discount line itself, set `invoice_validation_Reason` = "Amount has been adjusted (above)".
+
+## CRITICAL RULES
+- You MUST process ALL records returned by fetch_match_data. Do NOT skip any. Do NOT stop early.
+- Do NOT ask for permission or confirmation. Process every single record and save each result immediately.
+- Always use the tools for validation — do NOT compute amounts or thresholds yourself.
+- The `validate_invoice` tool handles ALL threshold logic. Trust its output.
+- After processing ALL records, report a brief summary.
+
+## OUTPUT FORMAT FOR save_validation_result
+
+When calling `save_validation_result`, pass a JSON string as `validation_json` with this structure:
+```json
+{{
+  "matching_status": "Match" | "Partial Match" | "No Match",
+  "erp_status": "Open" | "Close",
+  "invoices": [
+    {{
+      "invoiceNumber": "452700099001",
+      "invoiceDate": "2026-05-02",
+      "amount": 387.85,
+      "currency": "USD",
+      "invoice_validation_Status": "Match",
+      "invoice_validation_Reason": "Matched data has been validated with ERP"
+    }}
+  ],
+  "reasoning": "Step-by-step explanation of your validation logic"
+}}
+```
+
+NOTE: The Matching_Reason in the final output is preserved from the original match record. You only need to set matching_status, erp_status, and the per-invoice validation fields.
+"""
+
+
+# ── Validation Agent ─────────────────────────────────────────────────────────
+
+
+class ValidationAgent:
+    """Agent that validates match data against ERP data using LLM with tools.
+
+    Uses the modern LangChain API: llm.bind_tools() + manual tool-call loop.
+    The LLM orchestrates the workflow, while deterministic Python code handles
+    all validation logic (threshold comparison, status/reason assignment).
+    """
+
+    def __init__(
+        self,
+        repository: ValidationRepository = None,
+        match_container: str = MATCH_DATA_CONTAINER,
+        erp_container: str = ERP_DATA_CONTAINER,
+        validation_container: str = VALIDATION_CONTAINER,
+        llm_client=None,
+        dry_run: bool = False,
+    ):
+        self.repository = repository or ValidationRepository()
+        self.match_container = match_container
+        self.erp_container = erp_container
+        self.validation_container = validation_container
+        self.dry_run = dry_run
+
+        # Load settings
+        self._settings = get_settings()
+        self.threshold = self._settings.validation_threshold
+        self.max_retries = self._settings.validation_max_retries
+
+        # Load and cache all ERP records with indexed lookup
+        self._build_erp_lookup()
+
+        # Match data cache (populated when tool is called)
+        self._match_data_cache: List[dict] = []
+
+        # Track validation results for summary
+        self._results: List[dict] = []
+
+        # Initialise LLM + tools
+        self.llm = llm_client or self._create_llm()
+        self.tools = self._create_tools()
+        self.tool_map = {t.name: t for t in self.tools}
+        self.llm_with_tools = self.llm.bind_tools(self.tools)
+
+        # Prompt
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system", VALIDATION_SYSTEM_PROMPT),
+            ("human", "{input}"),
+        ])
+
+    # ── LLM ──────────────────────────────────────────────────────────────
+
+    def _create_llm(self):
+        """Create Azure OpenAI LLM client."""
+        return AzureChatOpenAI(
+            azure_deployment=os.getenv("AZURE_DEPLOYMENT", "gpt-4o"),
+            api_version=os.getenv("API_VERSION", "2025-01-01-preview"),
+            azure_endpoint=os.getenv("AZURE_ENDPOINT", "").split("/openai/")[0],
+            api_key=os.getenv("API_KEY"),
+            temperature=0,
+        )
+
+    # ── Data helpers ─────────────────────────────────────────────────────
+
+    def _build_erp_lookup(self) -> None:
+        """Fetch and cache all ERP records, building an indexed lookup.
+
+        Creates two indexes:
+        - _erp_by_invoice: dict keyed by invoice_number for O(1) lookup
+        - _erp_by_customer: dict keyed by lowered customer_name for O(1) lookup
+        """
+        self._all_erp_records = self.repository.get_cosmos_items(self.erp_container)
+
+        # Index by invoice_number (normalized by stripping leading zeros)
+        self._erp_by_invoice: Dict[str, List[dict]] = {}
+        for r in self._all_erp_records:
+            inv_num = str(r.get("invoice_number", "")).strip().lstrip('0')
+            if inv_num:
+                self._erp_by_invoice.setdefault(inv_num, []).append(r)
+
+        # Index by customer_name
+        self._erp_by_customer: Dict[str, List[dict]] = {}
+        for r in self._all_erp_records:
+            cust = (r.get("customer_name") or "").strip().lower()
+            if cust:
+                self._erp_by_customer.setdefault(cust, []).append(r)
+
+        logger.info(
+            f"Loaded {len(self._all_erp_records)} ERP records, "
+            f"{len(self._erp_by_invoice)} unique invoice numbers"
+        )
+
+    def _clean_cosmos_item(self, item: dict) -> dict:
+        """Remove Cosmos DB internal metadata fields."""
+        return {k: v for k, v in item.items() if not k.startswith("_")}
+
+    def _find_match_record(self, payment_unique_id: str) -> Optional[dict]:
+        """Find a match record by payment_unique_id from cache."""
+        for item in self._match_data_cache:
+            pid = item.get("payment_unique_id") or item.get("id", "")
+            if pid == payment_unique_id:
+                return item
+        return None
+
+    def _update_erp_status_by_invoices(self, invoice_numbers: List[str], status: str) -> bool:
+        """Update specific ERP records by invoice number to the given status."""
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Would update ERP for invoices {invoice_numbers} → {status}")
+            return True
+
+        all_ok = True
+        normalized_targets = [str(n).strip().lstrip('0') for n in invoice_numbers if n]
+        
+        for inv_num in normalized_targets:
+            matching_records = self._erp_by_invoice.get(inv_num, [])
+            for erp_record in matching_records:
+                updated_erp = self._clean_cosmos_item(erp_record)
+                updated_erp["Status"] = status
+                
+                # erp-data-container partition key is erp_id
+                partition_key = updated_erp.get("erp_id")
+                if not self.repository.upsert_cosmos_item(
+                    self.erp_container, 
+                    updated_erp, 
+                    partition_key=partition_key
+                ):
+                    all_ok = False
+                    
+        return all_ok
+
+    # ── Deterministic validation logic ───────────────────────────────────
+
+    def _compute_validation(
+        self, invoice_amount: float, erp_amount: float,
+        _customer_name: str, _erp_customer_name: str,
+    ) -> dict:
+        """Compute the validation status and reason deterministically.
+
+        This is pure business logic — no LLM involved.
+
+        Returns:
+            dict with difference_amount, invoice_validation_Status,
+            invoice_validation_Reason, and erp_status.
+        """
+        difference = round(invoice_amount - erp_amount, 2)
+        abs_diff = abs(difference)
+
+        if abs_diff == 0:
+            return {
+                "difference_amount": difference,
+                "invoice_validation_Status": "Match",
+                "invoice_validation_Reason": "Matched data has been validated with ERP",
+                "erp_status": "Close",
+            }
+        elif abs_diff <= self.threshold:
+            return {
+                "difference_amount": difference,
+                "invoice_validation_Status": "Match",
+                "invoice_validation_Reason": (
+                    "Autoprocess Because Amount Difference is within "
+                    "the Threshold Amount"
+                ),
+                "erp_status": "Close",
+            }
+        elif difference > self.threshold:
+            return {
+                "difference_amount": difference,
+                "invoice_validation_Status": "Partial Match",
+                "invoice_validation_Reason": "On account overpaid",
+                "erp_status": "Open",
+            }
+        else:  # difference < -threshold
+            return {
+                "difference_amount": difference,
+                "invoice_validation_Status": "Partial Match",
+                "invoice_validation_Reason": "On account underpaid",
+                "erp_status": "Open",
+            }
+
+    # ── Tools ────────────────────────────────────────────────────────────
+
+    def _create_tools(self):
+        """Create all tools the LLM can call."""
+
+        agent_self = self
+
+        @tool
+        def fetch_match_data() -> str:
+            """Fetch all records from the match-data-container.
+
+            Returns:
+                JSON string with a list of all match-data records.
+            """
+            items = agent_self.repository.get_cosmos_items(agent_self.match_container)
+            agent_self._match_data_cache = items
+            clean = [agent_self._clean_cosmos_item(it) for it in items]
+            logger.info(f"fetch_match_data: returned {len(clean)} records")
+            return json.dumps(clean, indent=2, default=str)
+
+        @tool
+        def search_erp(invoice_number: str) -> str:
+            """Search for ERP records by invoice number.
+
+            Returns only the matching ERP records, not the entire ERP dataset.
+
+            Args:
+                invoice_number: The invoice number to search for (normalized internally).
+
+            Returns:
+                JSON string with matching ERP records, or empty list.
+            """
+            # Normalize: strip leading zeros
+            norm_num = str(invoice_number).strip().lstrip('0')
+            matches = agent_self._erp_by_invoice.get(norm_num, [])
+            clean = [agent_self._clean_cosmos_item(r) for r in matches]
+            logger.info(
+                f"search_erp({invoice_number} -> {norm_num}): found {len(clean)} records"
+            )
+            return json.dumps(clean, indent=2, default=str)
+
+        @tool
+        def validate_invoice(
+            invoice_amount: float,
+            erp_amount: float,
+            customer_name: str,
+            erp_customer_name: str,
+        ) -> str:
+            """Validate an invoice amount against the ERP amount using
+            deterministic threshold rules.
+
+            This tool handles ALL validation logic — the LLM should NOT
+            compute thresholds or decide status/reason itself.
+
+            Args:
+                invoice_amount: The invoice amount from the match record.
+                erp_amount: The amount from the ERP record.
+                customer_name: Customer name from the match record.
+                erp_customer_name: Customer name from the ERP record.
+
+            Returns:
+                JSON with difference_amount, invoice_validation_Status,
+                invoice_validation_Reason, and erp_status.
+            """
+            result = agent_self._compute_validation(
+                invoice_amount, erp_amount, customer_name, erp_customer_name
+            )
+            threshold = agent_self.threshold
+            result["threshold_used"] = threshold
+            logger.info(
+                f"validate_invoice: {invoice_amount} vs {erp_amount} → "
+                f"{result['invoice_validation_Status']} "
+                f"(diff={result['difference_amount']}, threshold={threshold})"
+            )
+            return json.dumps(result, indent=2)
+
+        @tool
+        def update_erp_status(invoice_numbers: List[str], status: str) -> str:
+            """Update status for specific ERP records.
+
+            Args:
+                invoice_numbers: List of invoice numbers to update.
+                status: The new status ('Open' or 'Close').
+
+            Returns:
+                JSON confirmation of the update.
+            """
+            success = agent_self._update_erp_status_by_invoices(
+                invoice_numbers, status
+            )
+            result = {
+                "invoice_count": len(invoice_numbers),
+                "new_status": status,
+                "success": success,
+                "dry_run": agent_self.dry_run,
+            }
+            logger.info(
+                f"update_erp_status: {len(invoice_numbers)} invoices → {status} "
+                f"(success={success})"
+            )
+            return json.dumps(result, indent=2)
+
+        @tool
+        def save_validation_result(
+            payment_unique_id: str, validation_json: str
+        ) -> str:
+            """Save the validation result to the match-validation-container.
+
+            Args:
+                payment_unique_id: The unique payment ID being validated.
+                validation_json: JSON string with the validation decision
+                    containing: matching_status, erp_status, invoices[],
+                    reasoning
+
+            Returns:
+                JSON summary confirming the save.
+            """
+            try:
+                decision = json.loads(validation_json)
+            except json.JSONDecodeError as e:
+                return json.dumps({"error": f"Invalid JSON: {e}"})
+
+            match_record = agent_self._find_match_record(payment_unique_id)
+            if not match_record:
+                return json.dumps(
+                    {"error": f"Match record '{payment_unique_id}' not found"}
+                )
+
+            # Build the validated output record
+            validated_invoices = decision.get("invoices", [])
+            matching_status = decision.get("matching_status", "No Match")
+            erp_status = decision.get("erp_status", "Open")
+            reasoning = decision.get("reasoning", "")
+
+            # Strip difference_amount from invoice output (internal field)
+            for inv in validated_invoices:
+                inv.pop("difference_amount", None)
+
+            # Preserve original Matching_Reason from the match record
+            original_rem = match_record.get("remittance_details", {})
+            original_reason = original_rem.get(
+                "Matching_Reason", "Remmitance Has been matched"
+            )
+
+            validated_result = agent_self._clean_cosmos_item(match_record)
+            validated_result["remittance_details"] = {
+                "invoices": validated_invoices,
+                "Matching_Status": matching_status,
+                "Matching_Reason": original_reason,
+                "reasoning": reasoning,
+            }
+            validated_result["id"] = payment_unique_id
+            
+            # match-validation-data partition key is bank_remmittance_unique_id
+            # The original match record has payment_unique_id, let's use it for bank_remmittance_unique_id
+            validated_result["bank_remmittance_unique_id"] = payment_unique_id
+
+            # Save to match-validation-container
+            if agent_self.dry_run:
+                logger.info(
+                    f"[DRY RUN] Would save validation for "
+                    f"{payment_unique_id}: {matching_status}"
+                )
+                success = True
+            else:
+                success = agent_self.repository.upsert_cosmos_item(
+                    agent_self.validation_container, 
+                    validated_result,
+                    partition_key=validated_result["bank_remmittance_unique_id"]
+                )
+
+            # Track result
+            result_summary = {
+                "payment_unique_id": payment_unique_id,
+                "matching_status": matching_status,
+                "erp_status": erp_status,
+                "validation_saved": success,
+                "dry_run": agent_self.dry_run,
+            }
+            agent_self._results.append(result_summary)
+
+            logger.info(
+                f"save_validation_result: {payment_unique_id} → "
+                f"{matching_status} | ERP: {erp_status}"
+            )
+            return json.dumps(result_summary, indent=2)
+
+        return [
+            fetch_match_data,
+            search_erp,
+            validate_invoice,
+            update_erp_status,
+            save_validation_result,
+        ]
+
+    # ── Retry helper ─────────────────────────────────────────────────────
+
+    def _invoke_llm_with_retry(self, messages: list) -> object:
+        """Invoke the LLM with exponential backoff retry on transient errors.
+
+        Retries on any exception up to self.max_retries times.
+        """
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                return self.llm_with_tools.invoke(messages)
+            except Exception as e:
+                if attempt == self.max_retries:
+                    logger.error(
+                        f"LLM call failed after {self.max_retries} attempts: {e}"
+                    )
+                    raise
+                wait = 2 ** attempt  # 2s, 4s, 8s, ...
+                logger.warning(
+                    f"LLM call attempt {attempt} failed ({e}), "
+                    f"retrying in {wait}s..."
+                )
+                time.sleep(wait)
+
+    # ── Agent invocation loop ────────────────────────────────────────────
+
+    def _invoke_agent(self, input_text: str) -> str:
+        """Invoke the LLM with tools in a loop until a final answer is produced."""
+        messages = self.prompt.format_messages(input=input_text)
+
+        # Tool-call loop — allow up to 50 iterations for multi-record processing
+        for iteration in range(50):
+            logger.info(f"Agent iteration {iteration + 1}")
+            response = self._invoke_llm_with_retry(messages)
+
+            # If no tool calls, we have the final answer
+            if not response.tool_calls:
+                logger.info("Agent produced final answer")
+                return response.content
+
+            # Process tool calls
+            messages.append(response)
+            for tc in response.tool_calls:
+                tool_name = tc["name"]
+                tool_args = tc["args"]
+
+                if tool_name in self.tool_map:
+                    tool_result = self.tool_map[tool_name].invoke(tool_args)
+                else:
+                    tool_result = json.dumps(
+                        {"error": f"Unknown tool: {tool_name}"}
+                    )
+
+                messages.append(
+                    ToolMessage(content=str(tool_result), tool_call_id=tc["id"])
+                )
+                logger.info(f"Tool '{tool_name}' called with args: {tool_args}")
+
+        # Exhausted iterations
+        logger.warning("Agent exhausted max iterations")
+        return response.content if response else "Max iterations reached"
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def run(self) -> List[dict]:
+        """Run the validation agent on all match-data records.
+
+        Returns:
+            List of result summaries with payment_unique_id, matching_status,
+            and erp_status for each processed record.
+        """
+        logger.info("=" * 60)
+        logger.info("Starting validation agent (agentic LLM mode)...")
+        if self.dry_run:
+            logger.info("*** DRY RUN MODE — no data will be written ***")
+        logger.info(f"Threshold: ${self.threshold}, Max retries: {self.max_retries}")
+        logger.info("=" * 60)
+
+        self._results = []
+
+        output = self._invoke_agent(
+            "Validate ALL match-data records against ERP data now. "
+            "First call fetch_match_data to get all records. "
+            "Then for EVERY match record: use search_erp to find ERP records "
+            "for each invoice, then call validate_invoice for each one. "
+            "Then call save_validation_result for each record. "
+            "If the overall result is Match, call update_erp_status to close "
+            "the ERP records. "
+            "Do NOT stop or ask for confirmation — process every single record "
+            "and save each result immediately. After all records are processed, "
+            "report a brief summary."
+        )
+
+        logger.info("=" * 60)
+        logger.info(f"Validation complete. Processed {len(self._results)} records.")
+        logger.info("=" * 60)
+        logger.info(f"Agent summary:\n{output}")
+
+        return self._results
+
+
+# ── Factory ──────────────────────────────────────────────────────────────────
+
+
+def create_validation_agent(dry_run: bool = False) -> ValidationAgent:
+    """Factory function to create a validation agent with default settings."""
+    repository = ValidationRepository()
+    return ValidationAgent(repository=repository, dry_run=dry_run)
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+# if __name__ == "__main__":
+#     import sys
+
+#     logging.basicConfig(
+#         level=logging.INFO,
+#         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+#     )
+
+#     # Check for --dry-run flag
+#     is_dry_run = "--dry-run" in sys.argv
+
+#     print("\n" + "=" * 60)
+#     print("VALIDATION AGENT — Match Data vs ERP Reconciliation (Agentic)")
+#     if is_dry_run:
+#         print("*** DRY RUN MODE — no data will be written ***")
+#     print("=" * 60 + "\n")
+
+#     agent = create_validation_agent(dry_run=is_dry_run)
+
+#     try:
+#         results = agent.run()
+#     except Exception as e:
+#         logger.error(f"Validation agent failed: {e}", exc_info=True)
+#         sys.exit(1)
+
+#     # Print summary
+#     print("\n" + "=" * 60)
+#     print("VALIDATION RESULTS SUMMARY")
+#     print("=" * 60)
+
+#     for r in results:
+#         print(f"  {r['payment_unique_id']}")
+#         print(f"    Matching Status : {r['matching_status']}")
+#         print(f"    ERP Status      : {r['erp_status']}")
+#         if r.get("dry_run"):
+#             print("    (dry run — not saved)")
+#         print()
